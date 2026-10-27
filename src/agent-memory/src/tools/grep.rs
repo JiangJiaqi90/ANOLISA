@@ -120,7 +120,15 @@ pub fn grep(svc: &MemoryService, pattern: &str, opts: GrepOptions) -> Result<Vec
                 Err(_) => break,
             };
             if line.len() > MAX_LINE_LEN {
-                line.truncate(MAX_LINE_LEN);
+                // `String::truncate` panics when the cut lands inside a
+                // multi-byte sequence, so an oversized non-ASCII line would
+                // take down the MCP worker on an ordinary `mem_grep`. Back off
+                // to the nearest char boundary that still fits the cap.
+                let mut cut = MAX_LINE_LEN;
+                while !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                line.truncate(cut);
             }
             if re.is_match(&line) {
                 hits.push(GrepHit {

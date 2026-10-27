@@ -282,6 +282,22 @@ fn grep_respects_glob_filter() {
     assert_eq!(hits[0].path, "notes/a.md");
 }
 
+#[test]
+fn grep_truncates_overlong_multibyte_line_without_panicking() {
+    // 3000 CJK characters are 9000 bytes, so the 4096-byte cut lands inside
+    // a multi-byte sequence. Truncating by raw byte index used to panic here
+    // and take the MCP worker down on an ordinary mem_grep call.
+    let (_t, svc) = setup();
+    let long_line = "中".repeat(3000);
+    svc.write("notes/long.md", &format!("{long_line}\n"), false)
+        .unwrap();
+
+    let hits = svc.grep("中", GrepOptions::default()).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].text.len() <= 4096, "line cap was not enforced");
+    assert!(hits[0].text.chars().all(|c| c == '中'));
+}
+
 // ---------- mem_diff ----------
 
 #[test]

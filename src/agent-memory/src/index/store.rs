@@ -432,8 +432,9 @@ impl BM25Store {
         );
         let bind = match_bind(&fts_q, top_k, &agent_param, &category_param);
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows: Vec<(String, String, f64, String, i64)> = stmt
-            .query_map(rusqlite::params_from_iter(bind.iter()), |row| {
+        let rows: Vec<(String, String, f64, String, i64)> = decode_rows(stmt.query_map(
+            rusqlite::params_from_iter(bind.iter()),
+            |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -441,9 +442,8 @@ impl BM25Store {
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                 ))
-            })?
-            .flatten()
-            .collect();
+            },
+        )?)?;
 
         // OR fallback: FTS5 implicit-AND semantics return 0 results
         // when any single query term is absent from the corpus.
@@ -476,8 +476,8 @@ impl BM25Store {
             );
             let or_bind = match_bind(&or_q, top_k, &agent_param, &category_param);
             let mut or_stmt = self.conn.prepare(&or_sql)?;
-            or_stmt
-                .query_map(rusqlite::params_from_iter(or_bind.iter()), |row| {
+            decode_rows(
+                or_stmt.query_map(rusqlite::params_from_iter(or_bind.iter()), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -485,9 +485,8 @@ impl BM25Store {
                         row.get::<_, String>(3)?,
                         row.get::<_, i64>(4)?,
                     ))
-                })?
-                .flatten()
-                .collect()
+                })?,
+            )?
         } else {
             rows
         };
@@ -624,7 +623,7 @@ impl BM25Store {
                         row.get::<_, i64>(2)?,
                     ))
                 })?;
-                Ok(rows.flatten().collect())
+                decode_rows(rows)
             };
 
         let rows = run_query(" AND ", top_k * 4, false)?;
@@ -772,8 +771,8 @@ impl BM25Store {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
         })?;
 
-        let results: Vec<(String, f64)> = rows
-            .flatten()
+        let results: Vec<(String, f64)> = decode_rows(rows)?
+            .into_iter()
             .filter(|(_, score)| *score >= threshold)
             .collect();
 
@@ -824,7 +823,7 @@ impl BM25Store {
         })?;
 
         let mut out: Vec<(String, f64)> = Vec::new();
-        for row in rows.flatten() {
+        for row in decode_rows(rows)? {
             let (path, body, mtime_ms) = row;
             // Case-insensitive frequency: SQLite LIKE is ASCII
             // case-insensitive, so a Rust `matches()` (case-sensitive) would
@@ -921,11 +920,11 @@ impl BM25Store {
         })?;
 
         let mut scores: Vec<(String, f64)> = Vec::new();
+        // Stream row by row rather than collecting: this is an unbounded
+        // full-table scan, and materialising every embedding blob at once
+        // would put the whole vector corpus in memory.
         for row in rows {
-            let (path, blob, mtime_opt) = match row {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+            let (path, blob, mtime_opt) = row?;
             let stored = blob_to_f32(&blob);
             if stored.len() != q_norm.len() {
                 continue;
@@ -1141,6 +1140,18 @@ impl BM25Store {
             )
             .ok()
     }
+}
+
+/// Collect the rows of a `query_map`, turning a row-level decode error into
+/// an error instead of dropping the row.
+///
+/// The retrieval paths used to `flatten()` these iterators, which discarded
+/// any row SQLite could hand back but the decoder could not read. Callers
+/// then saw a successful empty or partial answer and could not distinguish
+/// "nothing matched" from "a match could not be read".
+fn decode_rows<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>> {
+    rows.collect::<std::result::Result<Vec<T>, rusqlite::Error>>()
+        .map_err(MemoryError::from)
 }
 
 /// Strip FTS5 snippet highlight markers («, », …) so that prompt-injection

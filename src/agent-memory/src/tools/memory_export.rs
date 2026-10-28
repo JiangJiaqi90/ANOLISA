@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::audit::AuditEntry;
-use crate::error::Result;
+use crate::error::{MemoryError, Result};
 use crate::service::MemoryService;
 
 /// One exported memory entry.
@@ -125,6 +125,28 @@ pub(crate) fn parse_frontmatter(content: &str) -> (HashMap<String, String>, Stri
 
 /// Export the memory store to AMA JSON format.
 pub fn memory_export(svc: &MemoryService, filter: &ExportFilter) -> Result<String> {
+    match build_export(svc, filter) {
+        Ok((json, count)) => {
+            svc.audit_log(
+                AuditEntry::new("mem_export")
+                    .path(format!("{count} memories"))
+                    .bytes(json.len() as u64),
+            );
+            Ok(json)
+        }
+        Err(e) => {
+            // The failure this function now reports is exactly what an
+            // operator needs to find in the audit trail, so it is recorded
+            // before being handed back.
+            svc.audit_log(AuditEntry::new("mem_export").error(e.to_string()));
+            Err(e)
+        }
+    }
+}
+
+/// Walk the store and serialize the AMA archive. Split out so the public
+/// entry point can audit both outcomes.
+fn build_export(svc: &MemoryService, filter: &ExportFilter) -> Result<(String, usize)> {
     let mut memories = Vec::new();
     let mut tasks = Vec::new();
     let mut stats = ExportStats::default();
@@ -136,10 +158,17 @@ pub fn memory_export(svc: &MemoryService, filter: &ExportFilter) -> Result<Strin
         .into_iter()
         .filter_entry(|e| !e.path().starts_with(&meta_dir))
     {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let entry = entry.map_err(|e| {
+            // A directory the walker cannot traverse would silently shrink
+            // the archive: every memory below it vanishes while the export
+            // still reports success. Fail with the path so the user can fix
+            // permissions and re-run.
+            let where_ = e
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unknown>".into());
+            MemoryError::Other(format!("export walk {where_}: {e}"))
+        })?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -154,10 +183,15 @@ pub fn memory_export(svc: &MemoryService, filter: &ExportFilter) -> Result<Strin
             .to_string_lossy()
             .to_string();
 
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        // A task the caller excluded is never read: failing the whole export
+        // on a file that would not appear in the archive would break stores
+        // whose memories are all readable.
+        if rel_path.starts_with("tasks/") && !filter.include_tasks {
+            continue;
+        }
+
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| MemoryError::Other(format!("export read {rel_path}: {e}")))?;
 
         let (frontmatter, body) = parse_frontmatter(&content);
 
@@ -220,13 +254,7 @@ pub fn memory_export(svc: &MemoryService, filter: &ExportFilter) -> Result<Strin
     let json = serde_json::to_string_pretty(&archive)
         .map_err(|e| crate::error::MemoryError::Other(format!("export serialize: {e}")))?;
 
-    svc.audit_log(
-        AuditEntry::new("mem_export")
-            .path(format!("{} memories", archive.total_memories))
-            .bytes(json.len() as u64),
-    );
-
-    Ok(json)
+    Ok((json, archive.total_memories))
 }
 
 #[cfg(test)]
@@ -324,5 +352,85 @@ mod tests {
         assert_eq!(fm.get("title").unwrap(), "Test");
         assert!(fm.contains_key("next_steps"));
         assert!(body.contains("Body"));
+    }
+
+    #[test]
+    fn export_fails_instead_of_omitting_an_unreadable_memory() {
+        // A backup that silently drops a memory is worse than one that
+        // fails: the user may retire the source believing it was captured.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::AppConfig::default();
+        config.memory.paths.base_dir = tmp.path().to_string_lossy().to_string();
+        config.memory.index.enabled = false;
+        config.memory.git.enabled = false;
+        config.memory.mount.strategy = crate::mount::MountStrategyKind::Userland;
+        config.memory.session.base_dir = tmp.path().join("sessions").to_string_lossy().to_string();
+        let svc = MemoryService::new(config).unwrap();
+        svc.write("notes/good.md", "readable", false).unwrap();
+        // Invalid UTF-8 fails `read_to_string` for root and non-root alike,
+        // so the test does not depend on the runner's uid.
+        std::fs::write(
+            svc.mount.root.join("notes/broken.md"),
+            b"\xff\xfe not utf-8",
+        )
+        .unwrap();
+
+        let err = memory_export(&svc, &ExportFilter::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("notes/broken.md"),
+            "error must name the unreadable memory: {msg}"
+        );
+    }
+
+    #[test]
+    fn export_failure_is_recorded_in_the_audit_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::AppConfig::default();
+        config.memory.paths.base_dir = tmp.path().to_string_lossy().to_string();
+        config.memory.index.enabled = false;
+        config.memory.git.enabled = false;
+        config.memory.mount.strategy = crate::mount::MountStrategyKind::Userland;
+        config.memory.session.base_dir = tmp.path().join("sessions").to_string_lossy().to_string();
+        let svc = MemoryService::new(config).unwrap();
+        svc.write("notes/good.md", "readable", false).unwrap();
+        std::fs::write(svc.mount.root.join("notes/broken.md"), b"\xff\xfe").unwrap();
+
+        assert!(memory_export(&svc, &ExportFilter::default()).is_err());
+
+        let log = std::fs::read_to_string(svc.mount.audit_log_path()).unwrap();
+        assert!(
+            log.contains("\"tool\":\"mem_export\"") && log.contains("\"ok\":false"),
+            "a failed export must reach the audit trail: {log}"
+        );
+    }
+
+    #[test]
+    fn excluded_unreadable_task_does_not_fail_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::AppConfig::default();
+        config.memory.paths.base_dir = tmp.path().to_string_lossy().to_string();
+        config.memory.index.enabled = false;
+        config.memory.git.enabled = false;
+        config.memory.mount.strategy = crate::mount::MountStrategyKind::Userland;
+        config.memory.session.base_dir = tmp.path().join("sessions").to_string_lossy().to_string();
+        let svc = MemoryService::new(config).unwrap();
+        svc.write("notes/good.md", "readable", false).unwrap();
+        std::fs::create_dir_all(svc.mount.root.join("tasks")).unwrap();
+        std::fs::write(svc.mount.root.join("tasks/broken.md"), b"\xff\xfe").unwrap();
+
+        let json = memory_export(
+            &svc,
+            &ExportFilter {
+                include_tasks: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(json.contains("notes/good.md"));
+        assert!(
+            !json.contains("tasks/broken.md"),
+            "an excluded task must not appear in the archive"
+        );
     }
 }

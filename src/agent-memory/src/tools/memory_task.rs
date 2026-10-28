@@ -11,14 +11,24 @@
 //! - `memory_task_list` — list tasks filtered by status
 //! - `memory_task_close` — mark a task as done/cancelled
 
+use std::os::fd::AsFd;
+use std::path::{Path, PathBuf};
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditEntry;
 use crate::error::{MemoryError, Result};
+use crate::safe_fs;
 use crate::service::MemoryService;
 
 const TASKS_DIR: &str = "tasks";
+
+/// Mount-relative path of a task file. Callers validate the id to a single
+/// safe segment before this is reached.
+fn task_rel_path(id: &str) -> PathBuf {
+    Path::new(TASKS_DIR).join(format!("{id}.md"))
+}
 
 /// Task status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,11 +309,25 @@ fn load_all_tasks(svc: &MemoryService) -> Result<Vec<Task>> {
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let content = match std::fs::read_to_string(&path) {
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Reads go through the same rooted, symlink-refusing open as every
+        // other tool; a file that cannot be opened that way is skipped.
+        let content = match safe_fs::read_to_string(
+            svc.mount.root_fd.as_fd(),
+            &Path::new(TASKS_DIR).join(file_name),
+        ) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        if let Ok(task) = parse_task(&content) {
+        if let Ok(mut task) = parse_task(&content) {
+            // The frontmatter id is untrusted content, and the other task
+            // tools address this file by its name. Report the name so a
+            // planted id cannot produce a listing entry nothing accepts.
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                task.id = stem.to_string();
+            }
             tasks.push(task);
         }
     }
@@ -315,10 +339,18 @@ fn load_all_tasks(svc: &MemoryService) -> Result<Vec<Task>> {
 
 /// Save a task to the tasks/ directory.
 fn save_task(svc: &MemoryService, task: &Task) -> Result<()> {
-    let dir = svc.mount.root.join(TASKS_DIR);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.md", task.id));
-    std::fs::write(&path, task.to_markdown())?;
+    validate_task_id(&task.id)?;
+    let root_fd = svc.mount.root_fd.as_fd();
+    // `tasks/` is ordinary memory content, so it is created only after the
+    // same no-symlink check that guards every other rooted open — and the
+    // write itself goes through `safe_fs`, which refuses to follow a link.
+    safe_fs::assert_no_symlink_traversal(root_fd, Path::new(TASKS_DIR))?;
+    std::fs::create_dir_all(svc.mount.root.join(TASKS_DIR))?;
+    safe_fs::write(
+        root_fd,
+        &task_rel_path(&task.id),
+        task.to_markdown().as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -351,16 +383,19 @@ pub fn memory_task_save(
     // no matching task exists, create a new task with that id (the tool
     // description promises "update if exists, otherwise create new").
     let mut task = if let Some(existing_id) = id {
-        let path = svc
-            .mount
-            .root
-            .join(TASKS_DIR)
-            .join(format!("{existing_id}.md"));
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            parse_task(&content)?
-        } else {
-            Task {
+        let rel = task_rel_path(existing_id);
+        match safe_fs::read_to_string(svc.mount.root_fd.as_fd(), &rel) {
+            Ok(content) => {
+                let mut task = parse_task(&content)?;
+                // The frontmatter of a task file is ordinary memory content
+                // and can be planted with `mem_write`, so its `id:` is
+                // untrusted. Keep the caller-supplied id (already validated
+                // above): it also names the file we just read, so the write
+                // below stays inside `tasks/` whatever the file claims.
+                task.id = existing_id.to_string();
+                task
+            }
+            Err(MemoryError::NotFound(_)) => Task {
                 id: existing_id.to_string(),
                 title: title.to_string(),
                 status: TaskStatus::InProgress,
@@ -373,7 +408,8 @@ pub fn memory_task_save(
                 created_at: now.clone(),
                 updated_at: now.clone(),
                 context: String::new(),
-            }
+            },
+            Err(e) => return Err(e),
         }
     } else {
         Task {
@@ -456,11 +492,12 @@ pub fn memory_task_save(
 /// Load a task by id and return its full context for resuming work.
 pub fn memory_task_resume(svc: &MemoryService, id: &str) -> Result<String> {
     validate_task_id(id)?;
-    let path = svc.mount.root.join(TASKS_DIR).join(format!("{id}.md"));
-    if !path.exists() {
-        return Err(MemoryError::NotFound(format!("task {id}")));
-    }
-    let content = std::fs::read_to_string(&path)?;
+    let content = safe_fs::read_to_string(svc.mount.root_fd.as_fd(), &task_rel_path(id)).map_err(
+        |e| match e {
+            MemoryError::NotFound(_) => MemoryError::NotFound(format!("task {id}")),
+            other => other,
+        },
+    )?;
     let task = parse_task(&content)?;
 
     svc.audit_log(
@@ -550,11 +587,12 @@ pub fn memory_task_list(svc: &MemoryService, status_filter: Option<&str>) -> Res
 /// Mark a task as done or cancelled.
 pub fn memory_task_close(svc: &MemoryService, id: &str, reason: Option<&str>) -> Result<String> {
     validate_task_id(id)?;
-    let path = svc.mount.root.join(TASKS_DIR).join(format!("{id}.md"));
-    if !path.exists() {
-        return Err(MemoryError::NotFound(format!("task {id}")));
-    }
-    let content = std::fs::read_to_string(&path)?;
+    let content = safe_fs::read_to_string(svc.mount.root_fd.as_fd(), &task_rel_path(id)).map_err(
+        |e| match e {
+            MemoryError::NotFound(_) => MemoryError::NotFound(format!("task {id}")),
+            other => other,
+        },
+    )?;
     let mut task = parse_task(&content)?;
 
     task.status = TaskStatus::Done;
@@ -835,5 +873,63 @@ mod tests {
 
         let resume = memory_task_resume(&svc, "custom-id-42").unwrap();
         assert!(resume.contains("Brand new task"));
+    }
+
+    #[test]
+    fn task_save_refuses_symlinked_task_file() {
+        let (tmp, svc) = setup();
+        let tasks = svc.mount.root.join(TASKS_DIR);
+        std::fs::create_dir_all(&tasks).unwrap();
+        // A link planted inside the mount must not be followed: the write
+        // would land outside `tasks/`, and on resume the target's content
+        // would be echoed back to the model.
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "original").unwrap();
+        std::os::unix::fs::symlink(&outside, tasks.join("pwn.md")).unwrap();
+
+        let err = memory_task_save(
+            &svc,
+            "legit update",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("pwn"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MemoryError::PathOutsideMount(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "original",
+            "task save followed a symlink out of the mount"
+        );
+    }
+
+    #[test]
+    fn task_list_reports_file_name_not_planted_id() {
+        let (_tmp, svc) = setup();
+        let tasks = svc.mount.root.join(TASKS_DIR);
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join("real-id.md"),
+            "---\nid: ../../../escaped\ntitle: planted\nstatus: in-progress\n---\n",
+        )
+        .unwrap();
+
+        let listed = memory_task_list(&svc, None).unwrap();
+        assert!(
+            listed.contains("real-id"),
+            "the file name must be the listed id: {listed}"
+        );
+        assert!(
+            !listed.contains("escaped"),
+            "a planted frontmatter id must not reach the listing: {listed}"
+        );
     }
 }

@@ -315,6 +315,8 @@ fn load_all_tasks(svc: &MemoryService) -> Result<Vec<Task>> {
 
 /// Save a task to the tasks/ directory.
 fn save_task(svc: &MemoryService, task: &Task) -> Result<()> {
+    // Defence in depth for every caller: `task.id` becomes a path component.
+    validate_task_id(&task.id)?;
     let dir = svc.mount.root.join(TASKS_DIR);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.md", task.id));
@@ -358,7 +360,14 @@ pub fn memory_task_save(
             .join(format!("{existing_id}.md"));
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            parse_task(&content)?
+            let mut task = parse_task(&content)?;
+            // The frontmatter of a task file is ordinary memory content and
+            // can be planted with `mem_write`, so its `id:` is untrusted.
+            // Keep the caller-supplied id (already validated above): it also
+            // matches the file we just read, so the write below stays inside
+            // `tasks/` no matter what the file claims.
+            task.id = existing_id.to_string();
+            task
         } else {
             Task {
                 id: existing_id.to_string(),
@@ -556,6 +565,10 @@ pub fn memory_task_close(svc: &MemoryService, id: &str, reason: Option<&str>) ->
     }
     let content = std::fs::read_to_string(&path)?;
     let mut task = parse_task(&content)?;
+    // Same untrusted-content rule as the save path: the frontmatter id is
+    // whatever `mem_write` planted, so keep the validated caller id that
+    // selected this file.
+    task.id = id.to_string();
 
     task.status = TaskStatus::Done;
     task.progress = 100;
@@ -593,6 +606,24 @@ mod tests {
         config.memory.git.enabled = false;
         config.memory.consolidation.enabled = false;
         // Use the tmp dir as session dir too.
+        config.memory.session.base_dir = tmp.path().join("sessions").to_string_lossy().to_string();
+        let svc = MemoryService::new(config).unwrap();
+        (tmp, svc)
+    }
+
+    /// Like [`setup`], but the mount root sits two levels below the temp dir.
+    /// A `tasks/../../..` escape then resolves *inside* the `TempDir` instead
+    /// of the shared `TMPDIR`, so a failing run cannot leak `/tmp/escaped.md`
+    /// or delete a file that belongs to someone else.
+    fn setup_nested() -> (tempfile::TempDir, MemoryService) {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path().join("nested").join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let mut config = AppConfig::default();
+        config.memory.paths.base_dir = base.to_string_lossy().to_string();
+        config.memory.index.enabled = false;
+        config.memory.git.enabled = false;
+        config.memory.consolidation.enabled = false;
         config.memory.session.base_dir = tmp.path().join("sessions").to_string_lossy().to_string();
         let svc = MemoryService::new(config).unwrap();
         (tmp, svc)
@@ -835,5 +866,86 @@ mod tests {
 
         let resume = memory_task_resume(&svc, "custom-id-42").unwrap();
         assert!(resume.contains("Brand new task"));
+    }
+
+    #[test]
+    fn task_save_ignores_poisoned_frontmatter_id() {
+        let (_tmp, svc) = setup_nested();
+        let tasks = svc.mount.root.join(TASKS_DIR);
+        std::fs::create_dir_all(&tasks).unwrap();
+        // The path the pre-patch write actually took: `tasks/../../../escaped.md`.
+        // `setup_nested` keeps it inside the TempDir, so a failing run cleans
+        // up after itself.
+        let escape = tasks.join("..").join("..").join("..").join("escaped.md");
+        // `mem_write` can plant this file: the frontmatter id is ordinary
+        // memory content, and the update path used to trust it when building
+        // the destination path.
+        std::fs::write(
+            tasks.join("pwn.md"),
+            "---\nid: ../../../escaped\ntitle: planted\nstatus: in-progress\n---\n",
+        )
+        .unwrap();
+
+        memory_task_save(
+            &svc,
+            "legit update",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("pwn"),
+        )
+        .unwrap();
+
+        let updated = std::fs::read_to_string(tasks.join("pwn.md")).unwrap();
+        assert!(
+            updated.contains("legit update"),
+            "the requested task file was not updated: {updated}"
+        );
+        assert!(
+            updated.contains("id: pwn"),
+            "frontmatter id was not normalized to the validated id: {updated}"
+        );
+        assert!(
+            !escape.exists(),
+            "a poisoned frontmatter id wrote outside tasks/: {}",
+            escape.display()
+        );
+    }
+
+    #[test]
+    fn task_close_normalizes_poisoned_frontmatter_id() {
+        let (_tmp, svc) = setup_nested();
+        let tasks = svc.mount.root.join(TASKS_DIR);
+        std::fs::create_dir_all(&tasks).unwrap();
+        let escape = tasks.join("..").join("..").join("..").join("escaped.md");
+        std::fs::write(
+            tasks.join("pwn.md"),
+            "---\nid: ../../../escaped\ntitle: planted\nstatus: in-progress\n---\n",
+        )
+        .unwrap();
+
+        let result = memory_task_close(&svc, "pwn", Some("done")).unwrap();
+        assert!(result.contains("pwn"));
+
+        let closed = std::fs::read_to_string(tasks.join("pwn.md")).unwrap();
+        assert!(
+            closed.contains("id: pwn"),
+            "close must not reflect the planted id back: {closed}"
+        );
+        assert!(
+            closed.contains("status: done"),
+            "the requested task was not closed: {closed}"
+        );
+        // `memory_task_close` was the second traversal-write primitive: it
+        // returned Ok and wrote the closed task through the planted path.
+        assert!(
+            !escape.exists(),
+            "close wrote outside tasks/: {}",
+            escape.display()
+        );
     }
 }
